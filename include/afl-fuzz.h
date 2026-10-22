@@ -312,11 +312,15 @@ struct queue_entry {
   double perf_score,                    /* performance score                */
       weight;
 
+  /* Dynamic hits are diagnostic only; scheduling uses unique call-site coverage. */
   u32 risk_total_hits,
       risk_hot[RISK_HOT_ARRAY_SIZE],
-      risk_target_hits;     /* keep as stub until TARGET lane is actually wired */
+      risk_target_hits;     /* retained for compatibility; target lane is not wired */
+  u32 risk_total_sites,
+      risk_sites[RISK_HOT_ARRAY_SIZE];
   u8 risk_max_level,
-      risk_seen;
+      risk_seen,
+      risk_site_overflow;
   double risk_score;
 
   /* LinUCB cache */
@@ -586,6 +590,13 @@ struct foreign_sync {
 
 };
 
+typedef struct risk_site_entry {
+
+  u64 key;       /* raw call-site address; 0 is valid when level is nonzero */
+  u8 level;      /* 0 means empty; 1..3 are low, medium, high */
+
+} risk_site_entry_t;
+
 typedef struct afl_state {
 
   /* Position of this state in the global states list */
@@ -599,10 +610,25 @@ typedef struct afl_state {
   sharedmem_t risk_shm;
   u32 *risk_map,
       cur_risk_hot[RISK_HOT_ARRAY_SIZE],
-      cur_risk_total_hits;
+      cur_risk_total_hits,
+      cur_risk_sites[RISK_HOT_ARRAY_SIZE],
+      cur_risk_total_sites;
   u8 cur_risk_max_level,
+      cur_risk_site_overflow,
       risk_enabled,
-      risk_sched_enabled;
+      risk_sched_enabled,
+      risk_collect_for_episode,
+      risk_episode_active;
+
+  /* Fuzzer-side set of all risk call sites observed in this run. */
+  risk_site_entry_t *risk_global_sites;
+  u32 risk_global_site_count;
+  u8 risk_global_site_overflow;
+
+  /* New call sites attributed to the currently active LinUCB episode. */
+  u32 risk_episode_new_sites_by_level[RISK_HOT_ARRAY_SIZE];
+  u32 risk_episode_new_sites;
+  u8 risk_episode_new_max_level;
 
   /* Active phase-bandit decision for the currently selected seed */
   u8 phase_cur_arm,
@@ -1337,6 +1363,7 @@ void mark_as_variable(afl_state_t *, struct queue_entry *);
 void add_to_queue(afl_state_t *, u8 *, u32, u8);
 void destroy_queue(afl_state_t *);
 void update_bitmap_score(afl_state_t *, struct queue_entry *, bool);
+double risk_refresh_score(struct queue_entry *);
 void cull_queue(afl_state_t *);
 u32  calculate_score(afl_state_t *, struct queue_entry *);
 void recalculate_all_scores(afl_state_t *);
