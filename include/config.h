@@ -231,13 +231,30 @@
 
 #define USE_RISK_FEEDBACK              1U
 
-/* Old design-compatible defaults. Keep TARGET_SIZE at 0U for MVP if target
-   lane is not wired yet; switch to 32U once the target lane is really used. */
+/* Risk side-channel layout.
+   The first three words are raw dynamic hit counters. The next three words
+   count unique call sites observed in this execution. A fixed-capacity open-
+   addressed table stores each 64-bit call-site key and its risk level.
+   Keep RISK_SITE_TABLE_SIZE a power of two (the runtime uses a bit mask). */
 #define RISK_HOT_ARRAY_SIZE            3U
-#define RISK_TARGET_SIZE               0U     /* old-compatible value: 32U */
+#define RISK_TARGET_SIZE               0U     /* retained for compatibility */
+#define RISK_SITE_TABLE_SIZE            2048U
+#define RISK_GLOBAL_SITE_TABLE_SIZE     16384U
+#define RISK_SITE_SCORE_CAP             RISK_SITE_TABLE_SIZE
+#define RISK_SITE_ENTRY_WORDS           3U
+#define RISK_RAW_HITS_OFFSET            0U
+#define RISK_SITE_COUNTS_OFFSET         (RISK_RAW_HITS_OFFSET + RISK_HOT_ARRAY_SIZE)
+#define RISK_SITE_OVERFLOW_OFFSET       (RISK_SITE_COUNTS_OFFSET + RISK_HOT_ARRAY_SIZE)
+#define RISK_SITE_TABLE_OFFSET          (RISK_SITE_OVERFLOW_OFFSET + 1U)
+#define RISK_SHM_WORDS                  (RISK_SITE_TABLE_OFFSET + \
+                                         RISK_SITE_TABLE_SIZE * RISK_SITE_ENTRY_WORDS)
 
-/* +4: reserve small header/scratch slots if needed by runtime aggregation */
-#define RISK_SHM_WORDS                 (RISK_HOT_ARRAY_SIZE + RISK_TARGET_SIZE + 4U)
+#if (RISK_SITE_TABLE_SIZE & (RISK_SITE_TABLE_SIZE - 1U)) != 0
+  #error "RISK_SITE_TABLE_SIZE must be a power of two"
+#endif
+#if (RISK_GLOBAL_SITE_TABLE_SIZE & (RISK_GLOBAL_SITE_TABLE_SIZE - 1U)) != 0
+  #error "RISK_GLOBAL_SITE_TABLE_SIZE must be a power of two"
+#endif
 
 /* Per-level weights for queue-side normalization */
 #define RISK_LEVEL1_WEIGHT             1U
