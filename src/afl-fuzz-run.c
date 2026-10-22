@@ -45,22 +45,114 @@ u64 time_spent_working = 0;
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update afl->fsrv->trace_bits. */
 
+static inline u64 risk_site_hash(u64 key, u8 level) {
+
+  u64 x = key ^ ((u64)level * 0x9e3779b97f4a7c15ULL);
+  x ^= x >> 30;
+  x *= 0xbf58476d1ce4e5b9ULL;
+  x ^= x >> 27;
+  x *= 0x94d049bb133111ebULL;
+  x ^= x >> 31;
+  return x;
+
+}
+
+/* Returns 1 only when this call site is first observed by the fuzzer. */
+static inline u8 risk_global_site_insert(afl_state_t *afl, u64 key, u8 level) {
+
+  if (unlikely(!afl->risk_global_sites || afl->risk_global_site_overflow)) return 0;
+
+  u32 start = (u32)risk_site_hash(key, level) &
+              (RISK_GLOBAL_SITE_TABLE_SIZE - 1U);
+
+  for (u32 probe = 0; probe < RISK_GLOBAL_SITE_TABLE_SIZE; ++probe) {
+
+    u32 idx = (start + probe) & (RISK_GLOBAL_SITE_TABLE_SIZE - 1U);
+    risk_site_entry_t *entry = &afl->risk_global_sites[idx];
+
+    if (!entry->level) {
+
+      entry->key = key;
+      entry->level = level;
+      if (afl->risk_global_site_count != UINT32_MAX) {
+        ++afl->risk_global_site_count;
+      }
+      return 1;
+
+    }
+
+    if (entry->key == key && entry->level == level) return 0;
+
+  }
+
+  afl->risk_global_site_overflow = 1;
+  return 0;
+
+}
+
 static inline void risk_collect_from_side_channel(afl_state_t *afl,
                                                   afl_forkserver_t *fsrv) {
 
   memset(afl->cur_risk_hot, 0, sizeof(afl->cur_risk_hot));
+  memset(afl->cur_risk_sites, 0, sizeof(afl->cur_risk_sites));
   afl->cur_risk_total_hits = 0;
+  afl->cur_risk_total_sites = 0;
   afl->cur_risk_max_level = 0;
+  afl->cur_risk_site_overflow = 0;
 
   if (unlikely(!afl->risk_enabled || !fsrv->risk_map)) { return; }
 
   for (u32 i = 0; i < RISK_HOT_ARRAY_SIZE; ++i) {
 
-    u32 v = fsrv->risk_map[i];
-    afl->cur_risk_hot[i] = v;
-    afl->cur_risk_total_hits += v;
+    u32 hits = fsrv->risk_map[RISK_RAW_HITS_OFFSET + i];
+    u32 sites = fsrv->risk_map[RISK_SITE_COUNTS_OFFSET + i];
+    afl->cur_risk_hot[i] = hits;
+    afl->cur_risk_sites[i] = sites;
+    if (UINT32_MAX - afl->cur_risk_total_hits < hits) {
+      afl->cur_risk_total_hits = UINT32_MAX;
+    } else {
+      afl->cur_risk_total_hits += hits;
+    }
+    if (UINT32_MAX - afl->cur_risk_total_sites < sites) {
+      afl->cur_risk_total_sites = UINT32_MAX;
+    } else {
+      afl->cur_risk_total_sites += sites;
+    }
+    if (sites) afl->cur_risk_max_level = (u8)(i + 1U);
 
-    if (v) { afl->cur_risk_max_level = (u8)(i + 1); }
+  }
+
+  afl->cur_risk_site_overflow =
+      (u8)(fsrv->risk_map[RISK_SITE_OVERFLOW_OFFSET] != 0);
+
+  if (!afl->cur_risk_total_sites) return;
+
+  /* Merge every per-execution site into the fuzzer-wide fixed-capacity set.
+     Non-fuzzing runs establish a baseline; only common_fuzz_stuff marks a run
+     as belonging to the active LinUCB episode. */
+  for (u32 i = 0; i < RISK_SITE_TABLE_SIZE; ++i) {
+
+    u32 base = RISK_SITE_TABLE_OFFSET + i * RISK_SITE_ENTRY_WORDS;
+    u32 level = fsrv->risk_map[base + 2U];
+    if (!level || level > RISK_HOT_ARRAY_SIZE) continue;
+
+    u64 key = ((u64)fsrv->risk_map[base + 1U] << 32) |
+              (u64)fsrv->risk_map[base];
+    if (risk_global_site_insert(afl, key, (u8)level) &&
+        afl->risk_collect_for_episode && afl->risk_episode_active) {
+
+      u32 slot = level - 1U;
+      if (afl->risk_episode_new_sites_by_level[slot] != UINT32_MAX) {
+        ++afl->risk_episode_new_sites_by_level[slot];
+      }
+      if (afl->risk_episode_new_sites != UINT32_MAX) {
+        ++afl->risk_episode_new_sites;
+      }
+      if (level > afl->risk_episode_new_max_level) {
+        afl->risk_episode_new_max_level = (u8)level;
+      }
+
+    }
 
   }
 
@@ -506,6 +598,17 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
   u8 *old_sn = afl->stage_name;
 
   u64 calibration_start_us = get_cur_time_us();
+  if (afl->risk_enabled) {
+    q->risk_total_hits = 0;
+    memset(q->risk_hot, 0, sizeof(q->risk_hot));
+    q->risk_total_sites = 0;
+    memset(q->risk_sites, 0, sizeof(q->risk_sites));
+    q->risk_max_level = 0;
+    q->risk_seen = 0;
+    q->risk_site_overflow = 0;
+    q->risk_score = 0.0;
+    q->risk_target_hits = 0;
+  }
   if (unlikely(afl->shm.cmplog_mode)) { q->exec_cksum = 0; }
 
   /* Be a bit more generous about timeouts when resuming sessions, or when
@@ -537,6 +640,11 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
     }
 
     if (afl->risk_enabled && !afl->risk_map) {
+
+      if (!afl->risk_global_sites) {
+        afl->risk_global_sites = (risk_site_entry_t *)ck_alloc(
+            sizeof(risk_site_entry_t) * RISK_GLOBAL_SITE_TABLE_SIZE);
+      }
 
       afl->risk_shm.risk_mode = 1;
       afl->risk_shm.cmplog_mode = 0;
@@ -633,11 +741,22 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
 
     if (likely(afl->risk_enabled)) {
 
-      q->risk_total_hits = afl->cur_risk_total_hits;
-      memcpy(q->risk_hot, afl->cur_risk_hot, sizeof(q->risk_hot));
-      q->risk_max_level = afl->cur_risk_max_level;
-      q->risk_seen = (u8)(q->risk_total_hits != 0);
+      /* Calibration may execute the same input several times. Keep per-level
+         maxima so the queue entry is not defined by the final repetition. */
+      if (afl->cur_risk_total_hits > q->risk_total_hits) {
+        q->risk_total_hits = afl->cur_risk_total_hits;
+      }
+      for (u32 i = 0; i < RISK_HOT_ARRAY_SIZE; ++i) {
+        if (afl->cur_risk_hot[i] > q->risk_hot[i]) {
+          q->risk_hot[i] = afl->cur_risk_hot[i];
+        }
+        if (afl->cur_risk_sites[i] > q->risk_sites[i]) {
+          q->risk_sites[i] = afl->cur_risk_sites[i];
+        }
+      }
+      q->risk_site_overflow |= afl->cur_risk_site_overflow;
       q->risk_target_hits = 0;
+      (void)risk_refresh_score(q);
 
     }
 
@@ -1502,7 +1621,11 @@ u8 __attribute__((hot)) common_fuzz_stuff(afl_state_t *afl, u8 *out_buf,
 
   }
 
+  afl->risk_collect_for_episode = (u8)(afl->risk_episode_active &&
+                                        afl->risk_enabled &&
+                                        afl->risk_sched_enabled);
   fault = fuzz_run_target(afl, &afl->fsrv, afl->fsrv.exec_tmout);
+  afl->risk_collect_for_episode = 0;
 
   if (afl->stop_soon) { return 1; }
 

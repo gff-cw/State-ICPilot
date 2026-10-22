@@ -43,10 +43,13 @@ void run_afl_custom_queue_new_entry(afl_state_t *afl, struct queue_entry *q,
 
 #endif
 
-static inline double risk_refresh_score(struct queue_entry *q) {
+double risk_refresh_score(struct queue_entry *q) {
 
-  u64 total_hits = 0;
-  u64 weighted_hits = 0;
+  u64 total_sites = 0;
+  double weighted_sites = 0.0;
+  double max_weighted_sites =
+      log2(1.0 + (double)RISK_SITE_SCORE_CAP) *
+      (double)(RISK_LEVEL1_WEIGHT + RISK_LEVEL2_WEIGHT + RISK_LEVEL3_WEIGHT);
 
   q->risk_max_level = 0;
 
@@ -55,35 +58,27 @@ static inline double risk_refresh_score(struct queue_entry *q) {
     u32 weight = (i == 0) ? RISK_LEVEL1_WEIGHT
                  : (i == 1) ? RISK_LEVEL2_WEIGHT
                             : RISK_LEVEL3_WEIGHT;
+    u32 bounded_sites = q->risk_sites[i];
+    if (bounded_sites > RISK_SITE_SCORE_CAP) bounded_sites = RISK_SITE_SCORE_CAP;
 
-    total_hits += q->risk_hot[i];
-    weighted_hits += (u64)q->risk_hot[i] * (u64)weight;
-
-    if (q->risk_hot[i]) { q->risk_max_level = (u8)(i + 1); }
+    total_sites += q->risk_sites[i];
+    weighted_sites += (double)weight * log2(1.0 + (double)bounded_sites);
+    if (q->risk_sites[i]) q->risk_max_level = (u8)(i + 1U);
 
   }
 
-  q->risk_total_hits = (u32)total_hits;
-  q->risk_seen = (u8)(total_hits != 0);
+  q->risk_total_sites = (total_sites > UINT32_MAX) ? UINT32_MAX : (u32)total_sites;
+  q->risk_seen = (u8)(total_sites != 0);
 
-  if (!total_hits) {
+  if (!total_sites || !max_weighted_sites) {
     q->risk_score = 0.0;
     return 0.0;
   }
 
-  double score =
-      (double)weighted_hits / (double)(total_hits * (u64)RISK_LEVEL3_WEIGHT);
-
-  if (q->risk_max_level >= 3) {
-    score += 0.05;
-  } else if (q->risk_max_level == 2) {
-    score += 0.025;
-  }
-
-  if (score > 1.0) { score = 1.0; }
-
-  q->risk_score = score;
-  return score;
+  /* A bounded score based on unique call sites, never dynamic loop hits. */
+  q->risk_score = weighted_sites / max_weighted_sites;
+  if (q->risk_score > 1.0) q->risk_score = 1.0;
+  return q->risk_score;
 
 }
 
@@ -814,10 +809,13 @@ void add_to_queue(afl_state_t *afl, u8 *fname, u32 len, u8 passed_det) {
   /* Risk cache */
   q->risk_total_hits = 0;
   memset(q->risk_hot, 0, sizeof(q->risk_hot));
+  q->risk_target_hits = 0;
+  q->risk_total_sites = 0;
+  memset(q->risk_sites, 0, sizeof(q->risk_sites));
   q->risk_max_level = 0;
   q->risk_seen = 0;
+  q->risk_site_overflow = 0;
   q->risk_score = 0.0;
-  q->risk_target_hits = 0;
 
   /* LinUCB cache */
   q->lin_selects = 0;
@@ -1670,10 +1668,13 @@ u32 calculate_score(afl_state_t *afl, struct queue_entry *q) {
     alias-table rebuild path. */
   if (afl->linucb_mode && afl->risk_sched_enabled && q->risk_seen) {
 
-    double risk_local = q->risk_score +
-                        0.20 * log2(1.0 + (double)q->risk_total_hits) +
-                        0.35 * log2(1.0 + (double)q->risk_target_hits) +
-                        0.25 * (double)q->risk_max_level;
+    double max_sites =
+        (double)RISK_SITE_SCORE_CAP * (double)RISK_HOT_ARRAY_SIZE;
+    double site_coverage =
+        log2(1.0 + (double)q->risk_total_sites) / log2(1.0 + max_sites);
+    double risk_local = 1.4 * q->risk_score +
+                        0.9 * ((double)q->risk_max_level / 3.0) +
+                        1.5 * site_coverage;
 
     if (risk_local > 4.0) risk_local = 4.0;
     perf_score = (u32)((double)perf_score * (1.0 + 0.08 * risk_local));

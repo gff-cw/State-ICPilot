@@ -103,8 +103,20 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
   afl->risk_shm.map_size = sizeof(u32) * RISK_SHM_WORDS;
   afl->risk_map = NULL;
   memset(afl->cur_risk_hot, 0, sizeof(afl->cur_risk_hot));
+  memset(afl->cur_risk_sites, 0, sizeof(afl->cur_risk_sites));
   afl->cur_risk_total_hits = 0;
+  afl->cur_risk_total_sites = 0;
   afl->cur_risk_max_level = 0;
+  afl->cur_risk_site_overflow = 0;
+  afl->risk_collect_for_episode = 0;
+  afl->risk_episode_active = 0;
+  afl->risk_global_sites = NULL;
+  afl->risk_global_site_count = 0;
+  afl->risk_global_site_overflow = 0;
+  memset(afl->risk_episode_new_sites_by_level, 0,
+         sizeof(afl->risk_episode_new_sites_by_level));
+  afl->risk_episode_new_sites = 0;
+  afl->risk_episode_new_max_level = 0;
 
   afl->smallest_favored = -1;
   afl->afl_ijon_history_limit = 20;
@@ -1024,6 +1036,8 @@ void afl_state_deinit(afl_state_t *afl) {
 
   ck_free(afl->afl_env.afl_forksrv_supl_gids);
   if (afl->risk_map) { afl_shm_deinit(&afl->risk_shm); }
+  ck_free(afl->risk_global_sites);
+  afl->risk_global_sites = NULL;
 
   list_remove(&afl_states, afl);
 

@@ -93,11 +93,6 @@ typedef struct linucb_runtime {
   u64 before_saved_tmouts;
   u64 before_total_execs;
 
-  u32 before_risk_total_hits;
-  u32 before_risk_target_hits;
-  u8 before_risk_max_level;
-  double before_risk_score;
-
   u64 updates;
 
   phase_bandit_state_t phase;
@@ -236,24 +231,21 @@ static double linucb_risk_metric(afl_state_t *afl, struct queue_entry *q) {
 
   if (unlikely(!afl || !q || !afl->risk_sched_enabled || !q->risk_seen)) return 0.0;
 
-  double hot = 0.0;
-  for (u32 i = 0; i < RISK_HOT_ARRAY_SIZE; ++i) {
-
-    hot += (double)(i + 1) * (double)q->risk_hot[i];
-
-  }
-
-  double score = q->risk_score;
-  score += 0.15 * linucb_log2_1p_u32(q->risk_total_hits);
-  score += 0.30 * linucb_log2_1p_u32(q->risk_target_hits);
-  score += 0.25 * (double)q->risk_max_level;
-  score += 0.02 * hot;
-
-  if (q->mother && q->mother->risk_seen) {
-
-    score += 0.10 * q->mother->risk_score;
-
-  }
+  /* Dynamic hit counts are deliberately excluded: loops must not increase
+     scheduling pressure. Each term is normalized to a stable bounded range. */
+  const double max_sites =
+      (double)RISK_SITE_SCORE_CAP * (double)RISK_HOT_ARRAY_SIZE;
+  const double site_coverage =
+      linucb_clampd(log2(1.0 + (double)q->risk_total_sites) /
+                        log2(1.0 + max_sites),
+                    0.0, 1.0);
+  const double level = (double)q->risk_max_level / 3.0;
+  const double parent_score =
+      (q->mother && q->mother->risk_seen)
+          ? linucb_clampd(q->mother->risk_score, 0.0, 1.0)
+          : 0.0;
+  const double score = 1.4 * q->risk_score + 0.9 * level +
+                       1.5 * site_coverage + 0.2 * parent_score;
 
   return linucb_clampd(score, 0.0, RISK_CTX_CLAMP);
 
@@ -269,7 +261,7 @@ static void linucb_build_ctx(afl_state_t *afl, struct queue_entry *q, double *x)
   const double risk = linucb_risk_metric(afl, q);
   const double parent_risk =
       (q->mother && q->mother->risk_seen)
-          ? linucb_clampd(q->mother->risk_score, 0.0, RISK_CTX_CLAMP)
+          ? linucb_clampd(q->mother->risk_score, 0.0, 1.0)
           : 0.0;
 
   x[0] = 1.0;
@@ -286,9 +278,12 @@ static void linucb_build_ctx(afl_state_t *afl, struct queue_entry *q, double *x)
 
   /* New risk-aware / recency-aware features */
   x[11] = risk / RISK_CTX_CLAMP;
-  x[12] = linucb_clampd((double)q->risk_max_level / 4.0, 0.0, 2.0);
-  x[13] = linucb_clampd(linucb_log2_1p_u32(q->risk_target_hits) / 4.0, 0.0, 2.0);
-  x[14] = parent_risk / RISK_CTX_CLAMP;
+  x[12] = linucb_clampd((double)q->risk_max_level / 3.0, 0.0, 1.0);
+  x[13] = linucb_clampd(
+      linucb_log2_1p_u32(q->risk_sites[2]) /
+          log2(1.0 + (double)RISK_SITE_SCORE_CAP),
+      0.0, 1.0);
+  x[14] = parent_risk;
   x[15] = linucb_clampd(q->lin_reward_ema / 8.0, -1.5, 2.0);
   x[16] = linucb_clampd(q->phase_reward_ema / 8.0, -1.5, 2.0);
 
@@ -389,6 +384,21 @@ static inline double linucb_delta_u32(u32 now, u32 before) {
 
 }
 
+static double linucb_risk_novelty_reward(afl_state_t *afl,
+                                         double breadth_weight,
+                                         double level_weight) {
+
+  double weighted_levels = 0.0;
+  for (u32 i = 0; i < RISK_HOT_ARRAY_SIZE; ++i) {
+    weighted_levels += (double)(i + 1U) *
+                       log2(1.0 + (double)afl->risk_episode_new_sites_by_level[i]);
+  }
+
+  return breadth_weight * log2(1.0 + (double)afl->risk_episode_new_sites) +
+         level_weight * weighted_levels;
+
+}
+
 static void linucb_push_candidate(u32 *cand_ids, u32 *cand_count, u32 idx) {
 
   for (u32 i = 0; i < *cand_count; ++i) {
@@ -423,7 +433,18 @@ static void linucb_add_risk_frontier(afl_state_t *afl, u32 *cand_ids,
 
     for (u32 slot = 0; slot < 3; ++slot) {
 
-      if (s > best_score[slot]) {
+      u8 better = (s > best_score[slot]);
+      if (!better && best_idx[slot] != (u32)-1 &&
+          fabs(s - best_score[slot]) <= 1e-9) {
+        struct queue_entry *old_q = linucb_q_at(afl, best_idx[slot]);
+        if (old_q && (q->lin_selects < old_q->lin_selects ||
+            (q->lin_selects == old_q->lin_selects &&
+             q->risk_total_sites > old_q->risk_total_sites))) {
+          better = 1;
+        }
+      }
+
+      if (better) {
 
         for (u32 shift = 2; shift > slot; --shift) {
 
@@ -581,7 +602,7 @@ static u8 phase_select_arm(linucb_runtime_t *rt, afl_state_t *afl,
 }
 
 static double linucb_compute_reward(linucb_runtime_t *rt, afl_state_t *afl,
-                                    struct queue_entry *q, u8 skipped) {
+                                    u8 skipped) {
 
   double reward = 0.0;
 
@@ -592,27 +613,10 @@ static double linucb_compute_reward(linucb_runtime_t *rt, afl_state_t *afl,
   reward += 4.0 * linucb_delta_u64(afl->saved_hangs, rt->before_saved_hangs);
   reward += 1.5 * linucb_delta_u64(afl->saved_tmouts, rt->before_saved_tmouts);
 
-  if (q) {
-
-    double risk_total =
-        linucb_delta_u32(q->risk_total_hits, rt->before_risk_total_hits);
-    double risk_target =
-        linucb_delta_u32(q->risk_target_hits, rt->before_risk_target_hits);
-    double risk_score_gain =
-        (q->risk_score > rt->before_risk_score)
-            ? (q->risk_score - rt->before_risk_score)
-            : 0.0;
-    double risk_level_gain =
-        (q->risk_max_level > rt->before_risk_max_level)
-            ? (double)(q->risk_max_level - rt->before_risk_max_level)
-            : 0.0;
-
-    reward += 1.2 * linucb_log2_1p_u32((u32)risk_total);
-    reward += 2.0 * linucb_log2_1p_u32((u32)risk_target);
-    reward += 4.0 * risk_score_gain;
-    reward += 0.8 * risk_level_gain;
-
-  }
+  /* Reward only newly observed call sites from actual mutation executions.
+     Repeated loop hits and later calibration runs do not add risk reward. */
+  reward += linucb_risk_novelty_reward(afl, 0.8, 0.45);
+  reward += 0.35 * (double)afl->risk_episode_new_max_level;
 
   {
     double exec_delta =
@@ -626,7 +630,7 @@ static double linucb_compute_reward(linucb_runtime_t *rt, afl_state_t *afl,
 }
 
 static double phase_compute_reward(linucb_runtime_t *rt, afl_state_t *afl,
-                                   struct queue_entry *q, u8 skipped) {
+                                   u8 skipped) {
 
   double reward = 0.0;
 
@@ -636,22 +640,8 @@ static double phase_compute_reward(linucb_runtime_t *rt, afl_state_t *afl,
   reward += 4.0 * linucb_delta_u64(afl->saved_hangs, rt->before_saved_hangs);
   reward += 1.0 * linucb_delta_u64(afl->saved_tmouts, rt->before_saved_tmouts);
 
-  if (q) {
-
-    double risk_total =
-        linucb_delta_u32(q->risk_total_hits, rt->before_risk_total_hits);
-    double risk_target =
-        linucb_delta_u32(q->risk_target_hits, rt->before_risk_target_hits);
-    double risk_score_gain =
-        (q->risk_score > rt->before_risk_score)
-            ? (q->risk_score - rt->before_risk_score)
-            : 0.0;
-
-    reward += 1.5 * linucb_log2_1p_u32((u32)risk_total);
-    reward += 2.5 * linucb_log2_1p_u32((u32)risk_target);
-    reward += 4.5 * risk_score_gain;
-
-  }
+  reward += linucb_risk_novelty_reward(afl, 1.0, 0.60);
+  reward += 0.45 * (double)afl->risk_episode_new_max_level;
 
   {
     double exec_delta =
@@ -802,10 +792,12 @@ void linucb_begin_episode(afl_state_t *afl, struct queue_entry *q) {
   rt->before_saved_tmouts = afl->saved_tmouts;
   rt->before_total_execs = afl->fsrv.total_execs;
 
-  rt->before_risk_total_hits = q->risk_total_hits;
-  rt->before_risk_target_hits = q->risk_target_hits;
-  rt->before_risk_max_level = q->risk_max_level;
-  rt->before_risk_score = q->risk_score;
+  memset(afl->risk_episode_new_sites_by_level, 0,
+         sizeof(afl->risk_episode_new_sites_by_level));
+  afl->risk_episode_new_sites = 0;
+  afl->risk_episode_new_max_level = 0;
+  afl->risk_episode_active = (u8)(afl->risk_enabled && afl->risk_sched_enabled);
+  afl->risk_collect_for_episode = 0;
 
   {
     u8 arm = phase_select_arm(rt, afl, q);
@@ -833,13 +825,17 @@ void linucb_finish_episode(afl_state_t *afl, struct queue_entry *q, u8 skipped) 
   if (unlikely(!afl || !afl->linucb_mode)) return;
 
   linucb_runtime_t *rt = linucb_runtime_find(afl);
-  if (!rt || !rt->ep_seed) return;
+  if (!rt || !rt->ep_seed) {
+    afl->risk_collect_for_episode = 0;
+    afl->risk_episode_active = 0;
+    return;
+  }
 
   (void)q;
   struct queue_entry *seed = rt->ep_seed;
 
   {
-    double reward = linucb_compute_reward(rt, afl, seed, skipped);
+    double reward = linucb_compute_reward(rt, afl, skipped);
     linucb_update(rt, rt->ep_x, reward);
 
     seed->lin_selects += 1;
@@ -853,7 +849,7 @@ void linucb_finish_episode(afl_state_t *afl, struct queue_entry *q, u8 skipped) 
 
   {
     u8 arm = rt->phase.ep_arm;
-    double reward = phase_compute_reward(rt, afl, seed, skipped);
+    double reward = phase_compute_reward(rt, afl, skipped);
 
     rt->phase.pulls[arm] += 1;
     rt->phase.total_pulls += 1;
@@ -873,6 +869,8 @@ void linucb_finish_episode(afl_state_t *afl, struct queue_entry *q, u8 skipped) 
   }
 
   rt->ep_seed = NULL;
+  afl->risk_collect_for_episode = 0;
+  afl->risk_episode_active = 0;
 
   afl->phase_cur_arm = PHASE_ARM_BALANCED;
   afl->phase_energy_mult = 1.0;
