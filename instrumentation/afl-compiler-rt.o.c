@@ -476,23 +476,78 @@ static FORCEINLINE u32 __afl_risk_token_to_slot(unsigned int token) {
 
 }
 
-void __afl_risk_ins(unsigned int token) {
+static FORCEINLINE u64 __afl_risk_site_hash(u64 key, u32 slot) {
+
+  u64 x = key ^ ((u64)(slot + 1U) * 0x9e3779b97f4a7c15ULL);
+  x ^= x >> 30;
+  x *= 0xbf58476d1ce4e5b9ULL;
+  x ^= x >> 27;
+  x *= 0x94d049bb133111ebULL;
+  x ^= x >> 31;
+  return x;
+
+}
+
+static FORCEINLINE void __afl_risk_record_site(u64 key, u32 slot) {
+
+  if (__afl_risk_map[RISK_SITE_OVERFLOW_OFFSET]) return;
+
+  u32 start = (u32)__afl_risk_site_hash(key, slot) &
+              (RISK_SITE_TABLE_SIZE - 1U);
+
+  for (u32 probe = 0; probe < RISK_SITE_TABLE_SIZE; ++probe) {
+
+    u32 idx = (start + probe) & (RISK_SITE_TABLE_SIZE - 1U);
+    u32 *entry = &__afl_risk_map[RISK_SITE_TABLE_OFFSET +
+                                 idx * RISK_SITE_ENTRY_WORDS];
+    u32 stored_level = entry[2];
+
+    if (!stored_level) {
+
+      entry[0] = (u32)(key & 0xffffffffULL);
+      entry[1] = (u32)(key >> 32);
+      entry[2] = slot + 1U;
+      if (__afl_risk_map[RISK_SITE_COUNTS_OFFSET + slot] != UINT32_MAX) {
+        ++__afl_risk_map[RISK_SITE_COUNTS_OFFSET + slot];
+      }
+      return;
+
+    }
+
+    u64 stored_key = ((u64)entry[1] << 32) | (u64)entry[0];
+    if (stored_level == slot + 1U && stored_key == key) return;
+
+  }
+
+  /* The per-execution table is full. Counts are now lower bounds. */
+  __afl_risk_map[RISK_SITE_OVERFLOW_OFFSET] = 1U;
+
+}
+
+__attribute__((noinline)) void __afl_risk_ins(unsigned int token) {
 
   char *disable_risk = getenv(RISK_DISABLE_ENV_VAR);
   if (disable_risk && disable_risk[0] && disable_risk[0] != '0') {
     return;
   }
-  
+
   if (!USE_RISK_FEEDBACK || !__afl_risk_map) { return; }
 
   u32 slot = __afl_risk_token_to_slot(token);
   if (slot >= RISK_HOT_ARRAY_SIZE) { return; }
 
-#if 1
-  __afl_risk_map[slot] += 1 + ((u32)(1 + __afl_risk_map[slot]) == 0);
+  /* Keep dynamic counts for diagnostics only; saturate instead of wrapping. */
+  u32 *hits = &__afl_risk_map[RISK_RAW_HITS_OFFSET + slot];
+  if (*hits != UINT32_MAX) ++*hits;
+
+#if defined(__GNUC__) || defined(__clang__)
+  u64 site_key = (u64)(uintptr_t)__builtin_extract_return_addr(
+      __builtin_return_address(0));
 #else
-  ++__afl_risk_map[slot];
+  u64 site_key = 0;
 #endif
+
+  __afl_risk_record_site(site_key, slot);
 
 }
 
