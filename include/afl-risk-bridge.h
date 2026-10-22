@@ -22,8 +22,16 @@ void __afl_risk_ins(unsigned int token);
 #endif
 
 #if AFL_TRANSLATE_RISK_INS
-#  define __POLAR_INS(_X) \
-     do { __afl_risk_ins((unsigned int)(_X)); } while (0)
+#  if defined(__GNUC__) || defined(__clang__)
+#    define __POLAR_INS(_X) \
+       do { \
+         __afl_risk_ins((unsigned int)(_X)); \
+         __asm__ __volatile__("" ::: "memory"); \
+       } while (0)
+#  else
+#    define __POLAR_INS(_X) \
+       do { __afl_risk_ins((unsigned int)(_X)); } while (0)
+#  endif
 #else
 #  define __POLAR_INS(_X) \
      do { } while (0)
